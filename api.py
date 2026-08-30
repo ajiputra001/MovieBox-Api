@@ -735,6 +735,13 @@ async def get_stream_sources(
     - parse_hls: parse HLS master playlist untuk variant streams
     - parse_dash: parse DASH manifest untuk representation
     """
+    # Auto-resolve numeric subject_id if slug/string passed
+    if not str(subject_id).isdigit():
+        detail_res = await get_movie_detail(detail_path or subject_id)
+        real_sid = detail_res.get("data", {}).get("subject", {}).get("subjectId")
+        if real_sid:
+            subject_id = str(real_sid)
+
     # Step 1: get the player domain
     dom_data = await _make_request(f"{API_BASE}/media-player/get-domain")
     domain = dom_data.get("data", "https://netfilm.world").rstrip("/")
