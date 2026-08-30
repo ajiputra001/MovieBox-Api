@@ -1096,14 +1096,15 @@ async def _close_proxy_client():
 @app.api_route("/proxy/stream", methods=["GET", "HEAD"])
 async def proxy_stream(url: str, request: Request, obfuscated: bool = False):
     """Ultra-fast Stream Proxy — prioritize high-throughput AsyncClient pool with 128KB chunks, seamless Range seeking & DASH MPD rewriting."""
-    # Fix cut-off query params if request URL query contains unencoded '&'
+    # Fix cut-off query params if request URL query contains unencoded '&' or &amp;
     raw_query = request.url.query
     if "url=" in raw_query:
         url_part = raw_query.split("url=", 1)[1]
         if "&obfuscated=" in url_part:
             url_part = url_part.split("&obfuscated=")[0]
+        url_part = url_part.replace("&amp;", "&").replace("%26amp%3B", "&").replace("%26amp;", "&")
         from urllib.parse import unquote
-        extracted_url = unquote(url_part)
+        extracted_url = unquote(url_part).replace("&amp;", "&")
         if extracted_url:
             url = extracted_url
 
@@ -1155,8 +1156,11 @@ async def proxy_stream(url: str, request: Request, obfuscated: bool = False):
                         parts.append(xml_text[last_end:m.start()])
                         attr_name = m.group(1)
                         raw_seg_url = m.group(2).replace("&amp;", "&")
-                        encoded_seg_url = quote(raw_seg_url, safe="$%")
+                        from urllib.parse import quote, unquote
+                        clean_seg_url = unquote(raw_seg_url)
+                        encoded_seg_url = quote(clean_seg_url, safe="$%")
                         proxied_seg_url = f"{proxy_base}?url={encoded_seg_url}".replace("&", "&amp;")
+
                         parts.append(f'{attr_name}="{proxied_seg_url}"')
                         last_end = m.end()
                     parts.append(xml_text[last_end:])
@@ -1172,6 +1176,7 @@ async def proxy_stream(url: str, request: Request, obfuscated: bool = False):
                     return StreamingResponse(iter([rewritten_xml]), status_code=r.status_code, headers=pass_through)
                 except Exception as e:
                     print(f"[MPD REWRITE FALLBACK] {e}")
+
 
             pass_through = {}
             for key in ("content-type", "content-length", "content-range", "accept-ranges", "etag", "last-modified"):
