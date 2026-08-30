@@ -1,0 +1,15 @@
+[Unit]
+Description=Ajiputra-Project MovieBox API Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/www/MovieBox-Api
+ExecStart=/var/www/MovieBox-Api/start.sh
+Restart=always
+RestartSec=5
+Environment=PORT=8000
+
+[Install]
+WantedBy=multi-user.target
