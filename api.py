@@ -1079,12 +1079,13 @@ def _get_proxy_client() -> httpx.AsyncClient:
             follow_redirects=True,
             timeout=httpx.Timeout(30.0, connect=8.0, read=60.0, write=60.0, pool=30.0),
             limits=httpx.Limits(
-                max_connections=300,
-                max_keepalive_connections=100,
+                max_connections=500,
+                max_keepalive_connections=200,
                 keepalive_expiry=120.0,
             ),
         )
     return _proxy_client
+
 
 @app.on_event("shutdown")
 async def _close_proxy_client():
