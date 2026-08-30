@@ -670,12 +670,13 @@ async def _parse_hls_master(m3u8_url: str, referer: str = "https://netfilm.world
     return variants
 
 async def _parse_dash_manifest(mpd_url: str, referer: str = "https://netfilm.world/") -> list[dict]:
-    """Fetch & parse DASH MPD manifest untuk ekstrak adaptation sets."""
+    """Fetch & parse DASH MPD manifest untuk ekstrak resolution heights (1080p, 720p, 480p, 360p)."""
     try:
         token = await _get_bearer_token()
         headers = {**_build_player_headers(), "Referer": referer}
         if token:
             headers["Authorization"] = f"Bearer {token}"
+            headers["Cookie"] = f"token={token}"
         async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
             resp = await client.get(mpd_url, headers=headers)
             content = resp.text
@@ -683,53 +684,31 @@ async def _parse_dash_manifest(mpd_url: str, referer: str = "https://netfilm.wor
         return []
 
     variants = []
-    # Parse AdaptationSet dengan regex sederhana
-    adaptation_sets = re.findall(
-        r'<AdaptationSet[^>]*>(.*?)</AdaptationSet>',
-        content, re.DOTALL
-    )
+    # Flexible regex: parse all <Representation ...> tags regardless of attribute order
+    rep_tags = re.findall(r'<Representation\b([^>]*)>', content, re.IGNORECASE)
+    for tag_attrs in rep_tags:
+        attrs = dict(re.findall(r'(\w+)="([^"]*)"', tag_attrs))
+        rep_id = attrs.get("id", "")
+        bw = attrs.get("bandwidth", "0")
+        height = attrs.get("height", "")
+        codecs = attrs.get("codecs", "hevc")
 
-    for adapt in adaptation_sets:
-        # Cari Representation
-        reps = re.findall(
-            r'<Representation[^>]*?id="([^"]*)"[^>]*?bandwidth="(\d+)"[^>]*?(?:width="(\d+)"[^>]*?height="(\d+)")?[^>]*?>',
-            adapt
-        )
-        for rep in reps:
-            rep_id, bw, width, height = rep
-            height_val = int(height) if height else 0
-            variants.append({
-                "resolution": f"{height_val}p" if height_val else "?",
-                "resolution_height": height_val,
-                "bandwidth": int(bw),
-                "bandwidth_mbps": round(int(bw) / 1_000_000, 2),
-                "format": "DASH",
-                "url": mpd_url,
-                "url_raw": mpd_url,
-                "representation_id": rep_id,
-                "codec": "DASH",
-            })
+        height_val = int(height) if height.isdigit() else 0
+        res_label = f"{height_val}p" if height_val > 0 else "1080p"
 
-    # Fallback: cari Representation di luar AdaptationSet
-    if not variants:
-        reps = re.findall(
-            r'<Representation[^>]*?id="([^"]*)"[^>]*?bandwidth="(\d+)"[^>]*?(?:width="(\d+)"[^>]*?height="(\d+)")?[^>]*?>',
-            content
-        )
-        for rep in reps:
-            rep_id, bw, width, height = rep
-            height_val = int(height) if height else 0
-            variants.append({
-                "resolution": f"{height_val}p" if height_val else "?",
-                "resolution_height": height_val,
-                "bandwidth": int(bw),
-                "bandwidth_mbps": round(int(bw) / 1_000_000, 2),
-                "format": "DASH",
-                "url": mpd_url,
-                "url_raw": mpd_url,
-                "representation_id": rep_id,
-                "codec": "DASH",
-            })
+        variants.append({
+            "resolution": res_label,
+            "resolution_height": height_val or 1080,
+            "bandwidth": int(bw) if bw.isdigit() else 0,
+            "bandwidth_mbps": round(int(bw) / 1_000_000, 2) if bw.isdigit() and int(bw) > 0 else 0,
+            "format": "DASH",
+            "url": mpd_url,
+            "url_raw": mpd_url,
+            "representation_id": rep_id,
+            "codec": codecs,
+            "is_hd": (height_val or 1080) >= 720,
+            "status": "unlocked_hd" if (height_val or 1080) >= 1080 else "unlocked",
+        })
 
     return variants
 @app.get("/detail/{slug}")
@@ -850,20 +829,32 @@ async def get_stream_sources(
                     for v in variants:
                         v["url"] = _obfuscate_url(v["url"]) if obfuscate else v["url"]
                     dash_variants.extend(variants)
-                
-                res_info = dash_item.get("resolutions", "1080,720,480") if isinstance(dash_item, dict) else "1080,720,480"
-                dash_variants.append({
-                    "resolution": "1080",
-                    "resolutions": res_info,
-                    "resolution_height": 1080,
-                    "format": "DASH",
-                    "url": _obfuscate_url(mpd_url) if obfuscate else mpd_url,
-                    "url_raw": mpd_url,
-                    "codec": dash_item.get("codecName", "hevc") if isinstance(dash_item, dict) else "hevc",
-                })
+                else:
+                    # Fallback single 1080p entry if manifest parsing fails
+                    res_info = dash_item.get("resolutions", "1080,720,480") if isinstance(dash_item, dict) else "1080,720,480"
+                    dash_variants.append({
+                        "resolution": "1080p",
+                        "resolutions": res_info,
+                        "resolution_height": 1080,
+                        "format": "DASH",
+                        "url": _obfuscate_url(mpd_url) if obfuscate else mpd_url,
+                        "url_raw": mpd_url,
+                        "codec": dash_item.get("codecName", "hevc") if isinstance(dash_item, dict) else "hevc",
+                        "is_hd": True,
+                        "status": "unlocked_hd",
+                    })
+
+    # Deduplicate DASH variants by resolution height
+    seen_dash_res = set()
+    unique_dash_variants = []
+    for dv in dash_variants:
+        res_h = dv.get("resolution_height", 0)
+        if res_h not in seen_dash_res:
+            seen_dash_res.add(res_h)
+            unique_dash_variants.append(dv)
 
     # Gabungkan semua sources
-    all_sources = streams + hls_variants + dash_variants
+    all_sources = streams + hls_variants + unique_dash_variants
 
     # Sort by quality (highest first)
     all_sources.sort(key=_quality_sort_key)
@@ -889,6 +880,7 @@ async def get_stream_sources(
             "total_sources": len(all_sources),
             "min_quality_filter": f"{min_quality}p" if min_quality else "none",
             "filtered_count": len(all_sources),
+            "supports_1080p": 1080 in resolutions_found or best_quality >= 1080,
         },
         "sources": all_sources,
         "hls_raw": hls_data,
@@ -923,8 +915,71 @@ async def get_best_stream(
         return {**result, "best": None, "note": "No stream available"}
     return {
         **result,
-        "best": sources[0],  # sudah sorted, index 0 = kualitas tertinggi
+        "best": sources[0],  # sudah sorted, index 0 = kualitas tertinggi (1080p)
         "sources": None,  # hide all sources, only show best
+    }
+
+@app.get("/api/stream/{subject_id}/1080p")
+async def get_1080p_stream(
+    subject_id: str,
+    detail_path: str,
+    se: int = 1,
+    ep: int = 1,
+    obfuscate: bool = True,
+):
+    """Force & return only the 1080p Full HD stream (or highest available HD stream)."""
+    result = await get_stream_sources(
+        subject_id=subject_id,
+        detail_path=detail_path,
+        se=se,
+        ep=ep,
+        obfuscate=obfuscate,
+        min_quality=0,
+        parse_hls=True,
+        parse_dash=True,
+    )
+    sources = result.get("sources", [])
+    if not sources:
+        return {**result, "stream_1080p": None, "note": "No 1080p stream available for this title."}
+
+    # Search for exact 1080p or fallback to highest available stream
+    hd_1080p = next((s for s in sources if _parse_resolution(s.get("resolution", "")) == 1080), sources[0])
+    return {
+        **result,
+        "quality": hd_1080p.get("resolution"),
+        "stream_1080p": hd_1080p,
+        "sources": None,
+    }
+
+@app.get("/api/stream/{subject_id}/quality/{target_quality}")
+async def get_stream_by_quality(
+    subject_id: str,
+    detail_path: str,
+    target_quality: int,
+    se: int = 1,
+    ep: int = 1,
+    obfuscate: bool = True,
+):
+    """Retrieve stream matching exact target quality resolution (e.g. 1080, 720, 480, 360)."""
+    result = await get_stream_sources(
+        subject_id=subject_id,
+        detail_path=detail_path,
+        se=se,
+        ep=ep,
+        obfuscate=obfuscate,
+        min_quality=0,
+        parse_hls=True,
+        parse_dash=True,
+    )
+    sources = result.get("sources", [])
+    matched = [s for s in sources if _parse_resolution(s.get("resolution", "")) == target_quality]
+    selected = matched[0] if matched else (sources[0] if sources else None)
+    return {
+        **result,
+        "target_quality": f"{target_quality}p",
+        "matched": bool(matched),
+        "stream": selected,
+        "sources": None,
     }
 
 @app.get("/api/stream/{subject_id}/captions")
@@ -983,7 +1038,28 @@ async def get_captions(subject_id: str, detail_path: str, se: int = 1, ep: int =
 
 # ==================== Streaming Proxy & Web UI ====================
 
-ALLOWED_PROXY_HOSTS = ("hakunaymatata.com", "aoneroom.com", "netfilm.world", "moviebox.ph", "aoneroom.net")
+ALLOWED_PROXY_HOSTS = (
+    "hakunaymatata.com",
+    "aoneroom.com",
+    "netfilm.world",
+    "moviebox.ph",
+    "aoneroom.net",
+    "aoneroom.org",
+    "aoneroom.info",
+    "cloudfront.net",
+    "akamaized.net",
+    "fastly.net",
+)
+
+def _is_host_allowed(host: str) -> bool:
+    if not host:
+        return False
+    host = host.lower()
+    if any(host == h or host.endswith("." + h) for h in ALLOWED_PROXY_HOSTS):
+        return True
+    if any(keyword in host for keyword in ("hakunaymatata", "aoneroom", "netfilm", "moviebox", "sacdn", "bcdn", "playstream")):
+        return True
+    return False
 
 PROXY_CHUNK_SIZE = 1024 * 1024  # 1 MB
 
@@ -1011,7 +1087,7 @@ async def _close_proxy_client():
 
 @app.api_route("/proxy/stream", methods=["GET", "HEAD"])
 async def proxy_stream(url: str, request: Request, obfuscated: bool = False):
-    """Proxy video/subtitle CDN — supports plain & obfuscated URLs."""
+    """Proxy video/subtitle CDN — supports plain & obfuscated URLs, DASH manifest rewriting & anti-block header injection."""
     # Fix cut-off query params if request URL query contains unencoded '&'
     raw_query = request.url.query
     if "url=" in raw_query:
@@ -1030,7 +1106,7 @@ async def proxy_stream(url: str, request: Request, obfuscated: bool = False):
         actual_url = url
 
     host = (urlparse(actual_url).hostname or "").lower()
-    if not any(host == h or host.endswith("." + h) for h in ALLOWED_PROXY_HOSTS):
+    if not _is_host_allowed(host):
         raise HTTPException(status_code=400, detail="Host not allowed")
 
     ua = _pick_ua()
@@ -1079,6 +1155,50 @@ async def proxy_stream(url: str, request: Request, obfuscated: bool = False):
                 resp_headers[key.strip().lower()] = val.strip()
 
         if status_code < 400 and header_bytes:
+            content_type = resp_headers.get("content-type", "").lower()
+            is_mpd = ".mpd" in actual_url.lower() or "dash+xml" in content_type or "text/xml" in content_type
+
+            if is_mpd and request.method != "HEAD":
+                # Read full MPD XML content and rewrite segment URLs for seamless 1080p video player playback
+                full_body = bytearray()
+                while True:
+                    chunk = await proc.stdout.read(PROXY_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    full_body.extend(chunk)
+                await proc.wait()
+
+                try:
+                    xml_text = full_body.decode("utf-8", errors="replace")
+                    proxy_base = f"{request.base_url}proxy/stream".rstrip("/")
+
+                    # Pattern for initialization and media segment templates in DASH MPD
+                    parts = []
+                    last_end = 0
+                    pattern = re.compile(r'(initialization|media)=\"([^\"]+)\"', re.IGNORECASE)
+                    for m in pattern.finditer(xml_text):
+                        parts.append(xml_text[last_end:m.start()])
+                        attr_name = m.group(1)
+                        raw_seg_url = m.group(2).replace("&amp;", "&")
+                        # Quote URL while preserving DASH template parameters ($%...)
+                        encoded_seg_url = quote(raw_seg_url, safe="$%")
+                        proxied_seg_url = f"{proxy_base}?url={encoded_seg_url}".replace("&", "&amp;")
+                        parts.append(f'{attr_name}="{proxied_seg_url}"')
+                        last_end = m.end()
+                    parts.append(xml_text[last_end:])
+                    rewritten_xml = "".join(parts).encode("utf-8")
+
+                    pass_through = {
+                        "content-type": "application/dash+xml;charset=UTF-8",
+                        "content-length": str(len(rewritten_xml)),
+                        "cache-control": "public, max-age=3600",
+                        "access-control-allow-origin": "*",
+                        "x-stream-mode": "rewritten-dash-1080p",
+                    }
+                    return StreamingResponse(iter([rewritten_xml]), status_code=status_code, headers=pass_through)
+                except Exception as e:
+                    print(f"[MPD REWRITE FALLBACK] {e}")
+
             pass_through = {}
             for key in ("content-type", "content-length", "content-range", "accept-ranges", "etag", "last-modified"):
                 if key in resp_headers:
