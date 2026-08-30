@@ -8,4 +8,6 @@ from api import app
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    workers = int(os.environ.get("WORKERS", os.environ.get("WEB_CONCURRENCY", 4)))
+    uvicorn.run("api:app", host="0.0.0.0", port=port, workers=workers, reload=False)
+

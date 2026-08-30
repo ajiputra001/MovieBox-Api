@@ -8,5 +8,7 @@ if [ -d "venv" ]; then
 fi
 
 export PORT="${PORT:-8000}"
-echo "Starting Ajiputra-Project MovieBox API on port $PORT..."
+export WORKERS="${WORKERS:-4}"
+echo "Starting Ajiputra-Project MovieBox API on port $PORT with $WORKERS workers..."
 exec python main.py
+

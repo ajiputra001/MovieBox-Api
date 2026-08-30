@@ -1068,7 +1068,7 @@ def _is_host_allowed(host: str) -> bool:
         return True
     return False
 
-PROXY_CHUNK_SIZE = 1024 * 1024  # 1 MB
+PROXY_CHUNK_SIZE = 128 * 1024  # 128 KB for ultra-low TTFB & smooth streaming
 
 _proxy_client: httpx.AsyncClient | None = None
 
@@ -1077,10 +1077,10 @@ def _get_proxy_client() -> httpx.AsyncClient:
     if _proxy_client is None or _proxy_client.is_closed:
         _proxy_client = httpx.AsyncClient(
             follow_redirects=True,
-            timeout=httpx.Timeout(30.0, connect=10.0, read=60.0, write=60.0, pool=30.0),
+            timeout=httpx.Timeout(30.0, connect=8.0, read=60.0, write=60.0, pool=30.0),
             limits=httpx.Limits(
-                max_connections=32,
-                max_keepalive_connections=16,
+                max_connections=300,
+                max_keepalive_connections=100,
                 keepalive_expiry=120.0,
             ),
         )
@@ -1094,7 +1094,7 @@ async def _close_proxy_client():
 
 @app.api_route("/proxy/stream", methods=["GET", "HEAD"])
 async def proxy_stream(url: str, request: Request, obfuscated: bool = False):
-    """Proxy video/subtitle CDN — supports plain & obfuscated URLs, DASH manifest rewriting & anti-block header injection."""
+    """Ultra-fast Stream Proxy — prioritize high-throughput AsyncClient pool with 128KB chunks, seamless Range seeking & DASH MPD rewriting."""
     # Fix cut-off query params if request URL query contains unencoded '&'
     raw_query = request.url.query
     if "url=" in raw_query:
@@ -1118,68 +1118,35 @@ async def proxy_stream(url: str, request: Request, obfuscated: bool = False):
 
     ua = _pick_ua()
     range_header = request.headers.get("range")
-
-    # Gunakan curl via subprocess (httpx diblokir CDN)
-    cmd = [
-        "curl", "-s", "-D", "-", "--max-time", "60",
-        "-H", f"User-Agent: {ua}",
-        "-H", "Referer: https://moviebox.ph/",
-    ]
-    if request.method == "HEAD":
-        cmd.insert(1, "-I")
+    req_headers = {
+        "User-Agent": ua,
+        "Referer": "https://moviebox.ph/",
+        "Origin": "https://moviebox.ph",
+        "Accept": "*/*",
+    }
     if range_header:
-        cmd += ["-H", f"Range: {range_header}"]
-    cmd.append(actual_url)
+        req_headers["Range"] = range_header
 
-    # Try subprocess curl first (preferred for anti-CDN blocking)
+    client = _get_proxy_client()
+    method = "GET" if request.method != "HEAD" else "HEAD"
+
+    # Primary High-Performance Path: httpx AsyncClient Connection Pool
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        req = client.build_request(method, actual_url, headers=req_headers)
+        r = await client.send(req, stream=True)
 
-        header_bytes = bytearray()
-        while True:
-            chunk = await proc.stdout.read(1)
-            if not chunk:
-                break
-            header_bytes.extend(chunk)
-            if header_bytes.endswith(b"\r\n\r\n"):
-                break
-
-        header_text = header_bytes.decode("utf-8", errors="replace")
-        status_code = 200
-        resp_headers = {}
-        for line in header_text.split("\r\n"):
-            if line.startswith("HTTP/"):
-                try:
-                    status_code = int(line.split()[1])
-                except (IndexError, ValueError):
-                    pass
-            elif ":" in line:
-                key, _, val = line.partition(":")
-                resp_headers[key.strip().lower()] = val.strip()
-
-        if status_code < 400 and header_bytes:
-            content_type = resp_headers.get("content-type", "").lower()
+        if r.status_code < 400:
+            content_type = r.headers.get("content-type", "").lower()
             is_mpd = ".mpd" in actual_url.lower() or "dash+xml" in content_type or "text/xml" in content_type
 
-            if is_mpd and request.method != "HEAD":
-                # Read full MPD XML content and rewrite segment URLs for seamless 1080p video player playback
-                full_body = bytearray()
-                while True:
-                    chunk = await proc.stdout.read(PROXY_CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    full_body.extend(chunk)
-                await proc.wait()
+            if is_mpd and method != "HEAD":
+                full_body = await r.aread()
+                await r.aclose()
 
                 try:
                     xml_text = full_body.decode("utf-8", errors="replace")
                     proxy_base = f"{request.base_url}proxy/stream".rstrip("/")
 
-                    # Pattern for initialization and media segment templates in DASH MPD
                     parts = []
                     last_end = 0
                     pattern = re.compile(r'(initialization|media)=\"([^\"]+)\"', re.IGNORECASE)
@@ -1187,7 +1154,6 @@ async def proxy_stream(url: str, request: Request, obfuscated: bool = False):
                         parts.append(xml_text[last_end:m.start()])
                         attr_name = m.group(1)
                         raw_seg_url = m.group(2).replace("&amp;", "&")
-                        # Quote URL while preserving DASH template parameters ($%...)
                         encoded_seg_url = quote(raw_seg_url, safe="$%")
                         proxied_seg_url = f"{proxy_base}?url={encoded_seg_url}".replace("&", "&amp;")
                         parts.append(f'{attr_name}="{proxied_seg_url}"')
@@ -1202,46 +1168,100 @@ async def proxy_stream(url: str, request: Request, obfuscated: bool = False):
                         "access-control-allow-origin": "*",
                         "x-stream-mode": "rewritten-dash-1080p",
                     }
-                    return StreamingResponse(iter([rewritten_xml]), status_code=status_code, headers=pass_through)
+                    return StreamingResponse(iter([rewritten_xml]), status_code=r.status_code, headers=pass_through)
                 except Exception as e:
                     print(f"[MPD REWRITE FALLBACK] {e}")
 
             pass_through = {}
             for key in ("content-type", "content-length", "content-range", "accept-ranges", "etag", "last-modified"):
-                if key in resp_headers:
-                    pass_through[key] = resp_headers[key]
+                if key in r.headers:
+                    pass_through[key] = r.headers[key]
             pass_through.setdefault("cache-control", "public, max-age=3600")
 
-            async def body_stream():
+            async def async_httpx_stream():
                 try:
-                    while True:
-                        chunk = await proc.stdout.read(PROXY_CHUNK_SIZE)
-                        if not chunk:
-                            break
+                    async for chunk in r.aiter_bytes(PROXY_CHUNK_SIZE):
                         yield chunk
                 finally:
-                    await proc.wait()
+                    await r.aclose()
 
-            return StreamingResponse(body_stream(), status_code=status_code, headers=pass_through)
+            return StreamingResponse(async_httpx_stream(), status_code=r.status_code, headers=pass_through)
+        else:
+            await r.aclose()
     except Exception as e:
-        print(f"[PROXY FALLBACK] curl process error: {e}. Falling back to httpx async client...")
+        print(f"[HTTPX PROXY WARNING] {e}. Falling back to optimized curl process...")
 
-    # Smart Fallback: Use httpx AsyncClient
-    client = _get_proxy_client()
-    req_headers = {"User-Agent": ua, "Referer": "https://moviebox.ph/"}
+    # Secondary Path: Optimized Subprocess curl (no 1-byte read loop)
+    cmd = [
+        "curl", "-s", "-i", "--max-time", "60",
+        "-H", f"User-Agent: {ua}",
+        "-H", "Referer: https://moviebox.ph/",
+        "-H", "Origin: https://moviebox.ph",
+    ]
+    if request.method == "HEAD":
+        cmd.insert(1, "-I")
     if range_header:
-        req_headers["Range"] = range_header
+        cmd += ["-H", f"Range: {range_header}"]
+    cmd.append(actual_url)
 
     try:
-        req = client.build_request("GET" if request.method != "HEAD" else "HEAD", actual_url, headers=req_headers)
-        r = await client.send(req, stream=True)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        # Read first 8KB to parse headers efficiently without byte-by-byte loop
+        initial_chunk = await proc.stdout.read(8192)
+        if not initial_chunk:
+            await proc.wait()
+            raise HTTPException(status_code=502, detail="Empty response from upstream stream")
+
+        sep = b"\r\n\r\n"
+        sep_idx = initial_chunk.find(sep)
+        if sep_idx == -1:
+            sep = b"\n\n"
+            sep_idx = initial_chunk.find(sep)
+
+        if sep_idx != -1:
+            header_bytes = initial_chunk[:sep_idx]
+            body_remainder = initial_chunk[sep_idx + len(sep):]
+        else:
+            header_bytes = initial_chunk
+            body_remainder = b""
+
+        header_text = header_bytes.decode("utf-8", errors="replace")
+        status_code = 200
+        resp_headers = {}
+        for line in header_text.splitlines():
+            if line.startswith("HTTP/"):
+                try:
+                    status_code = int(line.split()[1])
+                except (IndexError, ValueError):
+                    pass
+            elif ":" in line:
+                key, _, val = line.partition(":")
+                resp_headers[key.strip().lower()] = val.strip()
+
         pass_through = {}
         for key in ("content-type", "content-length", "content-range", "accept-ranges", "etag", "last-modified"):
-            if key in r.headers:
-                pass_through[key] = r.headers[key]
+            if key in resp_headers:
+                pass_through[key] = resp_headers[key]
         pass_through.setdefault("cache-control", "public, max-age=3600")
 
-        return StreamingResponse(r.aiter_bytes(PROXY_CHUNK_SIZE), status_code=r.status_code, headers=pass_through)
+        async def curl_body_stream():
+            try:
+                if body_remainder:
+                    yield body_remainder
+                while True:
+                    chunk = await proc.stdout.read(PROXY_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                await proc.wait()
+
+        return StreamingResponse(curl_body_stream(), status_code=status_code, headers=pass_through)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Proxy stream failed: {str(e)}")
 
