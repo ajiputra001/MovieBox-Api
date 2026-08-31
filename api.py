@@ -191,54 +191,71 @@ def _build_player_headers() -> dict:
 def _random_jitter(min_ms: int = 10, max_ms: int = 40) -> float:
     return random.uniform(min_ms, max_ms) / 1000.0
 
-# ==================== TOKEN MANAGEMENT (DENGAN ROTASI) ====================
+# ==================== TOKEN MANAGEMENT (SMART MULTI-TOKEN POOL) ====================
 
-async def _get_bearer_token(force_refresh: bool = False) -> str:
-    """Auto-acquire & rotate guest JWT — multi-source fallback otomatis."""
-    global _bearer_token, _token_acquired_at
-    now = time.time()
-    if not force_refresh and _bearer_token and (now - _token_acquired_at) < 300:
-        return _bearer_token
-    _bearer_token = None
+_token_pool: list[dict] = []  # pool: [{"token": str, "ts": float, "limited": bool}]
 
+async def _fetch_single_fresh_token() -> str | None:
     token_urls = [
         f"{API_BASE}/home?host=moviebox.ph",
         "https://netfilm.world/wefeed-h5api-bff/home",
         f"{API_BASE}/home",
     ]
-
     client = _get_shared_client()
     for url in token_urls:
         try:
             headers = _build_default_headers()
-            resp = await client.get(url, headers=headers, timeout=10)
+            resp = await client.get(url, headers=headers, timeout=8)
             x_user = resp.headers.get("x-user") or resp.headers.get("X-User")
+            token = None
             if x_user:
                 try:
-                    _bearer_token = json.loads(x_user).get("token")
+                    token = json.loads(x_user).get("token")
                 except Exception:
                     pass
-            if not _bearer_token:
+            if not token:
                 cookie_lines = resp.headers.get_list("set-cookie") or [resp.headers.get("set-cookie", "")]
                 for c in cookie_lines:
                     if c:
                         m = re.search(r"token=([^;]+)", c)
                         if m:
-                            _bearer_token = m.group(1)
+                            token = m.group(1)
                             break
-            if _bearer_token:
-                _token_acquired_at = now
-                print(f"[TOKEN] Successfully acquired fresh token from {url}")
-                break
-        except Exception as e:
-            print(f"[TOKEN] Failed getting token from {url}: {e}")
+            if token:
+                return token
+        except Exception:
+            continue
+    return None
 
-    # Fallback ke valid guest JWT jika jaringan token gagal di cloud/datacenter
-    if not _bearer_token:
-        _bearer_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjY0NjgxMzMwMzc1NjYwNTk3NzYsImF0cCI6MywiZXh0IjoiMTc4ODAzMTU2OSIsImV4cCI6MTc5NTgwNzU2OSwiaWF0IjoxNzg4MDMxMjY5fQ.JHryJZrdHSEV47_p1Zy36ZAPwoUxr2cTc8FSow-rIGE"
-        _token_acquired_at = now
+async def _get_bearer_token(force_refresh: bool = False) -> str:
+    """Auto-acquire & rotate guest JWT pool — multi-device concurrency isolated."""
+    global _token_pool
+    now = time.time()
 
-    return _bearer_token
+    # Bersihkan token kadaluarsa (> 15 menit) atau yang terindikasi limited
+    _token_pool = [t for t in _token_pool if (now - t["ts"]) < 900 and not t.get("limited")]
+
+    if not force_refresh and len(_token_pool) >= 2:
+        # Rotasi token acak (round-robin) untuk mencegah rate-limit multi-device
+        selected = random.choice(_token_pool)
+        return selected["token"]
+
+    # Ambil token baru dari server upstream
+    fresh = await _fetch_single_fresh_token()
+    if fresh:
+        if not any(t["token"] == fresh for t in _token_pool):
+            _token_pool.append({"token": fresh, "ts": now, "limited": False})
+        return fresh
+
+    # Fallback ke token yang sudah ada di pool jika tersedia
+    if _token_pool:
+        return random.choice(_token_pool)["token"]
+
+    # Fallback terakhir jika jaringan token terhambat
+    fallback_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjY0NjgxMzMwMzc1NjYwNTk3NzYsImF0cCI6MywiZXh0IjoiMTc4ODAzMTU2OSIsImV4cCI6MTc5NTgwNzU2OSwiaWF0IjoxNzg4MDMxMjY5fQ.JHryJZrdHSEV47_p1Zy36ZAPwoUxr2cTc8FSow-rIGE"
+    if not any(t["token"] == fallback_token for t in _token_pool):
+        _token_pool.append({"token": fallback_token, "ts": now, "limited": False})
+    return fallback_token
 
 # ==================== URL OBFUSCATION ====================
 
@@ -1103,8 +1120,10 @@ async def proxy_stream(url: str, request: Request, obfuscated: bool = False):
         if "&obfuscated=" in url_part:
             url_part = url_part.split("&obfuscated=")[0]
         url_part = url_part.replace("&amp;", "&").replace("%26amp%3B", "&").replace("%26amp;", "&")
+        # Protect DASH format specifiers like %05d / %04d from being unquoted into \x05 ASCII control characters
+        url_part = url_part.replace("%05d", "__PCT05D__").replace("%2505d", "__PCT05D__").replace("%04d", "__PCT04D__").replace("%2504d", "__PCT04D__")
         from urllib.parse import unquote
-        extracted_url = unquote(url_part).replace("&amp;", "&")
+        extracted_url = unquote(url_part).replace("&amp;", "&").replace("__PCT05D__", "%05d").replace("__PCT04D__", "%04d")
         if extracted_url:
             url = extracted_url
 
@@ -1156,9 +1175,7 @@ async def proxy_stream(url: str, request: Request, obfuscated: bool = False):
                         parts.append(xml_text[last_end:m.start()])
                         attr_name = m.group(1)
                         raw_seg_url = m.group(2).replace("&amp;", "&")
-                        from urllib.parse import quote, unquote
-                        clean_seg_url = unquote(raw_seg_url)
-                        encoded_seg_url = quote(clean_seg_url, safe="$%")
+                        encoded_seg_url = quote(raw_seg_url, safe="$%")
                         proxied_seg_url = f"{proxy_base}?url={encoded_seg_url}".replace("&", "&amp;")
 
                         parts.append(f'{attr_name}="{proxied_seg_url}"')
