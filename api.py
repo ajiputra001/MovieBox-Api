@@ -235,7 +235,7 @@ async def _get_bearer_token(force_refresh: bool = False) -> str:
     # Bersihkan token kadaluarsa (> 15 menit) atau yang terindikasi limited
     _token_pool = [t for t in _token_pool if (now - t["ts"]) < 900 and not t.get("limited")]
 
-    if not force_refresh and len(_token_pool) >= 2:
+    if not force_refresh and _token_pool:
         # Rotasi token acak (round-robin) untuk mencegah rate-limit multi-device
         selected = random.choice(_token_pool)
         return selected["token"]
