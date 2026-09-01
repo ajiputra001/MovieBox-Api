@@ -14,7 +14,7 @@ if [ -d "venv" ]; then
 fi
 
 export PORT="${PORT:-8000}"
-export WORKERS="${WORKERS:-4}"
+export WORKERS="${WORKERS:-1}"
 echo "Starting Ajiputra-Project MovieBox API on port $PORT with $WORKERS workers..."
 exec $PYTHON_BIN main.py
 
