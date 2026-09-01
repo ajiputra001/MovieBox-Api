@@ -764,6 +764,12 @@ async def get_stream_sources(
     - parse_hls: parse HLS master playlist untuk variant streams
     - parse_dash: parse DASH manifest untuk representation
     """
+    # Cache check for stream sources (10 mins TTL)
+    ck = _cache_key("stream_sources", subject_id, se, ep, min_quality, parse_hls, parse_dash, obfuscate)
+    cached = _cache_get(ck, ttl=600)
+    if cached is not None:
+        return cached
+
     # Auto-resolve numeric subject_id if slug/string passed
     if not str(subject_id).isdigit():
         detail_res = await get_movie_detail(detail_path or subject_id)
@@ -905,7 +911,7 @@ async def get_stream_sources(
     ), reverse=True)
     best_quality = resolutions_found[0] if resolutions_found else 0
 
-    return {
+    res = {
         "subject_id": subject_id,
         "se": se,
         "ep": ep,
@@ -925,6 +931,8 @@ async def get_stream_sources(
         "limited": data.get("limited", False),
         "note": None if (has_resource or all_sources) else "No stream found for this episode."
     }
+    _cache_set(ck, res)
+    return res
 
 @app.get("/api/stream/{subject_id}/best")
 async def get_best_stream(
