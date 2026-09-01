@@ -20,11 +20,23 @@ app = FastAPI(
 )
 
 @app.middleware("http")
-async def add_watermark_headers(request: Request, call_next):
+async def log_client_requests(request: Request, call_next):
+    client_ip = (
+        request.headers.get("cf-connecting-ip")
+        or request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
+    method = request.method
+    path = request.url.path
+    query = request.url.query
+    full_path = f"{path}?{query}" if query else path
+
     response = await call_next(request)
     response.headers["X-Powered-By"] = "Ajiputra-Project"
     response.headers["X-Developer"] = "Ajiputra-Project"
     response.headers["X-Watermark"] = "Ajiputra-project"
+
+    print(f"INFO:    {client_ip} - \"{method} {full_path} HTTP/1.1\" {response.status_code}")
     return response
 
 app.add_middleware(
