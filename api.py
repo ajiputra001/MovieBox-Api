@@ -200,8 +200,8 @@ def _build_player_headers() -> dict:
         "sec-fetch-site": "same-origin",
     })
 
-def _random_jitter(min_ms: int = 10, max_ms: int = 40) -> float:
-    return random.uniform(min_ms, max_ms) / 1000.0
+def _random_jitter(min_ms: int = 0, max_ms: int = 0) -> float:
+    return 0.0
 
 # ==================== TOKEN MANAGEMENT (SMART MULTI-TOKEN POOL) ====================
 
@@ -755,8 +755,8 @@ async def get_stream_sources(
     ep: int = 1,
     obfuscate: bool = True,
     min_quality: int = 0,
-    parse_hls: bool = True,
-    parse_dash: bool = True,
+    parse_hls: bool = False,
+    parse_dash: bool = False,
 ):
     """
     Stream endpoint dengan dukungan kualitas penuh.
