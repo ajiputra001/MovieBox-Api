@@ -88,32 +88,62 @@ if not all_ok:
     sys.exit(1)
 "
 
-# 5. Create Production Start Helper Script
-echo -e "\n${YELLOW}[5/5] Generating production helper script (start.sh)...${NC}"
+# 5. Create Production Start Helper Script & Systemd Service
+echo -e "\n${YELLOW}[5/5] Generating production helper script (start.sh) & Systemd Service...${NC}"
 
-cat << 'EOF' > start.sh
+NPROCS=$(nproc 2>/dev/null || echo 2)
+WORKERS_COUNT=$((NPROCS * 2))
+
+cat << EOF > start.sh
 #!/usr/bin/env bash
 # Production Start Script for Ajiputra-Project MovieBox API
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-cd "$SCRIPT_DIR"
+SCRIPT_DIR="\$( cd "\$( dirname "\${BASH_SOURCE[0]}" )" && pwd )"
+cd "\$SCRIPT_DIR"
 
 if [ -d "venv" ]; then
     source venv/bin/activate
 fi
 
-export PORT="${PORT:-8000}"
-echo "Starting Ajiputra-Project MovieBox API on port $PORT..."
+export PORT="\${PORT:-8000}"
+export WORKERS="\${WORKERS:-$WORKERS_COUNT}"
+echo "Starting Ajiputra-Project MovieBox API on port \$PORT with \$WORKERS workers..."
 exec python main.py
 EOF
 
 chmod +x start.sh
 
+# Install Systemd Service jika di Linux dengan systemctl
+if command -v systemctl &> /dev/null; then
+    SERVICE_FILE="/etc/systemd/system/moviebox-api.service"
+    cat << EOF | ${SUDO:+$SUDO }tee $SERVICE_FILE > /dev/null
+[Unit]
+Description=Ajiputra-Project MovieBox API Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$(pwd)
+ExecStart=$(pwd)/start.sh
+Restart=always
+RestartSec=5
+Environment=PORT=8000
+Environment=WORKERS=$WORKERS_COUNT
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    ${SUDO:+$SUDO }systemctl daemon-reload
+    ${SUDO:+$SUDO }systemctl enable moviebox-api
+    ${SUDO:+$SUDO }systemctl restart moviebox-api
+    echo -e "${GREEN}✓ Systemd Service (moviebox-api) successfully registered & started on port 8000!${NC}"
+fi
+
 echo -e "\n${GREEN}================================================= ${NC}"
-echo -e "${GREEN} 🎉 INSTALLATION & VERIFICATION COMPLETED!        ${NC}"
+echo -e "${GREEN} 🎉 MOVIEBOX API DEPLOYMENT COMPLETED!            ${NC}"
 echo -e "${GREEN}================================================= ${NC}"
-echo -e "To start the API server on your Linux Server:"
-echo -e "  ${BLUE}./start.sh${NC}"
+echo -e "API Healthcheck: ${BLUE}curl http://127.0.0.1:8000/health${NC}"
+echo -e "Service Status : ${BLUE}systemctl status moviebox-api${NC}"
 echo -e ""
-echo -e "Or run via Docker:"
-echo -e "  ${BLUE}docker compose up -d${NC}"
-echo -e ""
+
